@@ -1,0 +1,230 @@
+---
+title: "Data Exploration"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(glmnet)
+library(elasticnet)
+library(tictoc)
+library(caret)
+library(progressr)
+```
+
+```{r}
+gamesdf_original = read_csv('../data/raw/MRegularSeasonDetailedResults.csv')
+
+str(gamesdf_original)
+```
+
+
+```{r}
+gamesdf = gamesdf_original %>%
+  mutate(WPossessions = WFGA - WOR + WTO + 0.475*WFTA,
+         LPossessions = LFGA - LOR + LTO + 0.475*LFTA,
+         Poss = ceiling((WPossessions + LPossessions) / 2),
+         Lloc = ifelse(WLoc == "H", "A", 
+                       ifelse(WLoc == "N", "N", "H")),
+         game_id = paste0(Season, DayNum, WTeamID, LTeamID))
+
+dfWin = gamesdf %>%
+  select(Season, DayNum, game_id, OppID = LTeamID, starts_with("W"), Poss) %>%
+  select(-WPossessions) %>%
+  rename_with(~ gsub("W", "", .x))
+
+colOrder = names(dfWin)
+
+dfLose = gamesdf %>%
+  select(Season, DayNum, game_id, OppID = WTeamID, starts_with("L"), Poss) %>%
+  select(-LPossessions) %>%
+  rename_with(~ gsub("L", "", .x)) %>%
+  rename(Loc = loc) %>%
+  select(all_of(colOrder))
+
+dfCombo = rbind(dfWin, dfLose) %>%
+  arrange(Season, DayNum, game_id)
+```
+
+```{r}
+statdf = dfCombo %>% 
+    arrange(Season, DayNum, game_id) %>%
+    left_join(dfCombo %>% select(game_id, OppID, Poss, FGA, OR, DR),
+              by=c("game_id", "TeamID" = "OppID"),
+              suffix=c("", "_opp")) %>% 
+    mutate(oRating_game = Score / Poss * 100,
+           toRating_game = TO / Poss * 100,
+           threeRate_game = FGA3 / FGA * 100,
+           foulRate_game = PF / Poss_opp * 100,
+           blockRate_game = Blk / FGA_opp * 100,
+           stealRate_game = Stl / Poss_opp * 100,
+           ftRate_game = FTM / FGA * 100,
+           assistRate_game = Ast / FGM * 100,
+           ORRate_game = OR / (OR + DR_opp) * 100,
+           DRRate_game = DR / (DR + OR_opp) * 100,
+           TRRate_game = (OR + DR) / (OR + DR + OR_opp + DR_opp) * 100,
+           eFGPct_game = (FGM + 0.5*FGM3) / FGA * 100) %>%
+    select(Season, DayNum, TeamID, OppID, Loc, tempo_game = Poss,
+           contains("_game"))
+```
+
+```{r}
+seasonUnadjusted = statdf %>%
+  select(Season, TeamID, contains("_game")) %>%
+  pivot_longer(cols = contains("_game"))
+```
+
+```{r}
+handlers(global=TRUE)
+
+GetBetas = function(years, cols, statdf) {
+  tic("Overall Training Time")
+  betaDF = tibble()
+  
+  for (s in years) {
+    p = progressor(along=cols)
+    p(sprintf("Season: %s", s), class = 'sticky')
+    tic(paste("Season:", s))
+    lastSeason = statdf %>% filter(Season == s) %>% mutate(across(TeamID:Loc, as.factor))
+    X = lastSeason %>% select(TeamID:Loc)
+  
+    X$Loc = relevel(X$Loc, ref="N")
+  
+    dummyModel = dummyVars(~., data=X, sparse=TRUE)
+    XDummy = predict(dummyModel, X)
+    XDummy = Matrix(XDummy[, -(ncol(XDummy)-2)], sparse=TRUE)
+  
+    set.seed(1)
+    K = 10
+    trControl = trainControl(method='cv', number=K, returnResamp = "all")
+  
+    for (c in cols) {
+      Y = lastSeason %>% select(all_of(c)) %>% unlist()
+      ridgeOut = train(x = XDummy, y = Y, method='glmnet',
+                       tuneGrid = expand.grid(alpha=0,
+                                              lambda=10^(seq(log10(0.0001), log10(500), length=100))),
+                       trControl=trControl)
+      
+      optLambda = ridgeOut$bestTune$lambda
+      set.seed(1)
+      glmnetOut = glmnet(x = XDummy, y = Y, alpha=0, lambda = optLambda)
+      betas = tibble('team' = row.names(coef(glmnetOut)),
+                     'betas' = coef(glmnetOut)[1:length(coef(glmnetOut))])
+      betaDF = rbind(betaDF, betas %>%
+                mutate(Season = s, stattype = c) %>%
+                select(Season, stat=team, stattype, betas))
+      p(sprintf("x=%g", x))
+    }
+    toc()
+  }
+  toc()
+  return(betaDF)
+}
+
+betaDF = GetBetas(seq(2019, 2022), cols, statdf)
+```
+```{r}
+betaDF %>%
+  pivot_wider(id_cols = c(Season, stattype), names_from = stat, values_from = betas) %>%
+    select(Season, stattype, "(Intercept)", contains("ID"), contains("Loc")) %>%
+  View
+```
+
+
+```{r}
+betaMatrixFull = betaDF %>% 
+    filter(Season == 2020) %>%
+    pivot_wider(id_cols = c(Season, stattype), names_from = stat, values_from = betas) %>%
+    select(stattype, "(Intercept)", contains("ID"), contains("Loc")) 
+
+
+betaMatrixFull = betaMatrixFull[,-1]
+betaMatrixFull[is.na(betaMatrixFull)] = 0
+```
+
+```{r}
+GetStatTable = function(inputGames, BetaDF=betaDF, Statdf=statdf) {
+  seasons = unique(inputGames$Season)
+  earliestSeason = min(BetaDF$Season)
+  holdingStats = tibble()
+  
+  for (s in seasons) {
+    betaMatrix = BetaDF %>% 
+                  pivot_wider(id_cols = c(Season, stattype),
+                              names_from = stat,
+                              values_from = betas) %>%
+                  filter(Season == s) %>%
+                  select(stattype, "(Intercept)",
+                         contains("ID"), contains("Loc")) 
+  
+    statNames = betaMatrix$stattype
+    
+    betaMatrix = betaMatrix[,-1]
+    betaMatrix[is.na(betaMatrix)] = 0
+    
+    holding = inputGames %>%
+                filter(Season == s) %>%
+                select(Season, DayNum, TeamID:Loc) %>%
+                mutate(gameid = paste0(Season, DayNum, TeamID, OppID)) %>%
+                select(-DayNum)
+    rawX = holding %>%
+            rbind(holding %>%
+            select(Season, TeamID.n = OppID, OppID = TeamID, Loc, gameid) %>%
+            rename(TeamID = TeamID.n) %>%
+            mutate(Loc = as.factor(case_when(Loc == "H" ~ "A",
+                                         Loc == "A" ~ "H",
+                                         TRUE ~ "N")))) %>%
+            arrange(Season, gameid)
+    
+    gameids = rawX$gameid
+    rawX = rawX %>% select(TeamID:Loc) %>% mutate_all(as.factor)
+    teams = rawX$TeamID
+    
+    Xfull = Statdf %>%
+              filter(Season >= earliestSeason) %>%
+              mutate(across(TeamID:Loc, as.factor)) %>%
+              select(TeamID:Loc)
+    
+    Xfull$Loc = relevel(Xfull$Loc, ref="N")
+    
+    fullDummyModel = dummyVars(~., data=Xfull, sparse=TRUE)
+    XDummy = predict(fullDummyModel, rawX)
+    XDummy = XDummy[, -(ncol(XDummy)-2)]
+    
+    # was having issues with betaMatrix columns not aligning with dummy matrix
+    betaMatrix = betaMatrix %>%
+                  select("(Intercept)", all_of(names(as_tibble(XDummy))))
+    
+    XDummy = cbind(rep(1, nrow(XDummy)), XDummy)
+    
+    statOut = XDummy %*% t(as.matrix(betaMatrix))
+    statOut = as_tibble(statOut)
+    names(statOut) = statNames
+    
+    statOut$TeamID = teams
+    statOut$gameid = gameids
+    fullStatOut = rawX %>%
+                    left_join(statOut, by="TeamID") %>%
+                    mutate(Season = s)
+    
+    holdingStats = rbind(holdingStats, fullStatOut)
+  }
+  
+  combinedOut = holdingStats %>%
+                  left_join(holdingStats %>% select(-c(Loc, TeamID, Season)),
+                            by=c('gameid', "TeamID" = "OppID"),
+                            suffix=c("", "_opp")) %>%
+                  filter(as.numeric(TeamID) < as.numeric(OppID))
+  
+  temp = combinedOut %>%
+           select(-c(Season, gameid, TeamID, OppID, Loc)) %>%
+           names
+  
+  return(combinedOut %>%
+      select(Season, gameid, TeamID, OppID, Loc, all_of(temp)))
+}
+```
+
+
+
+

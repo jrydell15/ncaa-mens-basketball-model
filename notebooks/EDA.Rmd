@@ -1,0 +1,117 @@
+---
+title: "EDA"
+output: html_document
+---
+
+# Loading Libraries and Data Sets
+```{r setup, include=FALSE}
+library(tidyverse)
+library(caret)
+library(corrplot)
+library(GGally)
+
+theme_set(theme_minimal())
+
+load('../data/input/CenteredScaledDF.Rdata')
+```
+
+```{r}
+exploring = CenteredScaledDF %>%
+              select(-c(OppID, Loc, gameid))
+
+rm(CenteredScaledDF)
+```
+
+About the data: these are opponent and location adjusted numbers that have been centered and scaled on a season-by-season basis to put all seasons and teams on a level playing field.
+
+## Are the Numbers Predictive?
+
+Before building a model with this data, it would be wise to make sure the data is even worth building a model on. The first piece of the puzzle is to see if the adjusted Offensive Rating times the Adjusted Tempo is predictive of the true points scored in the game. For this, we will use the uncentered and unscaled data frame since it will be easier to work with. The goal of the project is to build a predictive model for the NCAA Tournament, so this data is 100% based on the Regular Season data.
+
+```{r}
+load('../data/adjusted/AllAdjustedStatsDF.Rdata')
+gamesdf = read_csv('../data/raw/MRegularSeasonDetailedResults.csv')
+
+gamesdf = gamesdf %>%
+            mutate(lowerTeam = ifelse(WTeamID < LTeamID, WTeamID, LTeamID),
+                   higherTeam = ifelse(lowerTeam == WTeamID, LTeamID, WTeamID),
+                   gameid = paste0(Season, DayNum, lowerTeam, higherTeam),
+                   pointsScored = ifelse(lowerTeam == WTeamID, WScore, LScore),
+                   pointsGiven = ifelse(lowerTeam == WTeamID, LScore, WScore)) %>%
+            select(gameid, pointsScored, pointsGiven)
+
+AdjustedStats = AllAdjustedStatsDF %>%
+                  select(Season, gameid, expORating = oRating_game, tempo_game,
+                         expDRating = oRating_game_opp, dTempo = tempo_game_opp) %>%
+                  mutate(expTempo = (tempo_game + dTempo)/2) %>%
+                  left_join(gamesdf, by="gameid") %>%
+                  mutate(across(Season, as.factor),
+                         expPoints = expORating / 100 * expTempo,
+                         expPointsGiven = expDRating / 100 * expTempo,
+                         diffOffense = pointsScored - expPoints,
+                         diffDefense = pointsGiven - expPointsGiven) %>%
+                  select(Season, expORating, expPoints, expDRating, expPointsGiven,
+                         diffOffense, diffDefense)
+
+rm(AllAdjustedStatsDF)
+
+```
+```{r}
+AdjustedStats %>%
+  ggplot(aes(x = expPoints, y = diffOffense, color = Season)) +
+  geom_point(alpha = 0.5) +
+  labs(title='Expected Points vs Residuals',
+       x = 'Expected Offensive Points',
+       y = 'Residuals') +
+  guides(color=guide_legend(ncol=2))
+```
+
+I'm fairly pleased with this. It looks like the mean is centered around 0 and the residuals look fairly Normal. It does seem like there are some issues when the expected point are really high, but that makes sense.
+
+```{r}
+AdjustedStats %>%
+  ggplot(aes(x = expPointsGiven, y = diffDefense, color = Season)) +
+  geom_point(alpha = 0.5) +
+  labs(title='Expected Points Given Up vs Residuals',
+       x = 'Expected Opponent Points',
+       y = 'Residuals') +
+  guides(color=guide_legend(ncol=2))
+```
+
+Overall, I'm pleased with these two plots. The defensive plot seems quite a bit more stable which worries me. The data is setup so that the lower Team ID in each game is the "offensive" team. As such, I'm a little worried that if the Team IDs were assigned in chronological order, teams that have a longer history might be traditionally better.
+
+## Exploring how the Team IDs are assigned
+```{r}
+teams = read_csv('../data/raw/MTeams.csv')
+
+teams %>%
+  ggplot(aes(x = TeamID, y = FirstD1Season)) +
+  geom_point() +
+  theme_minimal()
+
+exploring %>%
+  group_by(TeamID) %>%
+  summarize(winPct = sum(win) / n()) %>%
+  ggplot(aes(x = TeamID, y = winPct)) +
+  geom_point()
+  
+```
+
+Based on these two plots, it doesn't seem like there's anything to worry about.
+
+## Looking at Correlations
+
+```{r}
+ggpairs(exploring %>% select(tempo_game:ORRate_game, win) %>% mutate(across(win, as.factor)) %>% sample_frac(0.1),
+        aes(color=win), upper="blank", axisLabels = "internal")
+```
+
+Looks like ORating, toRating, and foulRate are most correlated with winning and for the most part (outside of ORating and toRating), the features are mostly uncorrelated, which is great because that means that there isn't a ton of overlapping information.
+
+
+```{r fig.align='center'}
+corrplot(cor(exploring %>% select(-c(TeamID, Season))), order='hclust', diag=FALSE, tl.cex=.6,
+         mar=c(.1,.05,1,.05), type='upper')
+```
+
+Not surprisingly, opposites are highly correlated, especially with the rebounding stats. Also no surprise that a high steal rate is positively correlated with the turnover rate for the opponent. I'm most surprised that there is no correlation between winning and three point attempt rates.

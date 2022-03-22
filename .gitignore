@@ -1,0 +1,10 @@
+*.log
+*.pdf
+*.aux
+*.out
+*.Rproj
+*.rdb
+*.rdx
+*.rda
+*__packages
+.Rproj.user*

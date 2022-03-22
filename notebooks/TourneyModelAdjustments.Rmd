@@ -1,0 +1,255 @@
+---
+title: "Adjusting Models for Tournament"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(caret)
+library(pROC)
+
+wlModel = readRDS('../models/RegularSeasonWL.rda')
+scoreModel = readRDS('../models/RegularSeasonScoreRegression.rda')
+oppScoreModel = readRDS('../models/RegularSeasonScoreRegressionOpponent.rda')
+totalModel = readRDS('../models/RegularSeasonScoreRegressionTotalScore.rda')
+```
+
+## Get Tourney datasets
+1. Build input games
+2. Adjust
+
+
+```{r}
+load('../data/input/TourneyCenteredScaledDF.Rdata')
+```
+
+```{r}
+CenteredScaledDF = CenteredScaledDF %>%
+                    filter(Season != 2022)
+
+partitionVars = CenteredScaledDF %>%
+                  select(Season, win) %>%
+                  mutate_all(as.factor)
+
+Xfull = CenteredScaledDF %>%
+          select(-c(Season, gameid, TeamID, OppID, Loc, win, score, score_opp, totalScore))
+Yfull = as.factor(CenteredScaledDF$win)
+Yfull = relevel(Yfull, ref="1")
+
+rm(CenteredScaledDF)
+```
+
+```{r}
+set.seed(42)
+n = nrow(partitionVars)
+groups = partitionVars %>%
+          group_by(Season, win) %>%
+          group_indices()
+trainIndex = createDataPartition(as.factor(groups), p=0.5, list=FALSE) %>% as.vector(.)
+
+validSplit = createDataPartition(as.factor(groups)[-trainIndex], p=0.5, list=FALSE) %>% as.vector(.)
+
+testIndex = (1:n)[-trainIndex][-validSplit]
+validIndex = (1:n)[-trainIndex][validSplit]
+```
+
+```{r}
+Xtrain = Xfull[trainIndex,]
+Xvalid = Xfull[validIndex,]
+Xtest = Xfull[testIndex,]
+
+Ytrain = Yfull[trainIndex]
+Yvalid = Yfull[validIndex]
+Ytest = Yfull[testIndex]
+```
+
+```{r}
+set.seed(42)
+
+#K = 10
+#trControl = trainControl(method = 'cv', number = K)
+#outLogistic = train(x = Xtrain, y = Ytrain, trControl = trControl, method = 'glm')
+
+YhatValidLogistic = predict(wlModel, Xvalid, type='prob')
+
+#saveRDS(outLogistic, file='../models/RegularSeasonWL.rda')
+```
+
+```{r}
+calibProbs = calibration(Yvalid ~ predict(wlModel, Xvalid, type='prob')$"1", cuts=10)
+xyplot(calibProbs)
+```
+
+```{r}
+load('../data/input/TourneyCenteredScaledDF.Rdata')
+
+CenteredScaledDF = CenteredScaledDF %>%
+                    filter(Season != 2022)
+
+partitionVars = CenteredScaledDF %>%
+                  select(Season, win) %>%
+                  mutate_all(as.factor)
+
+Xfull = CenteredScaledDF %>%
+          select(-c(Season, gameid, TeamID, OppID, Loc, win, score, score_opp, totalScore))
+Xfull$wlProbs = predict(wlModel, Xfull, type='prob')$'1'
+Xfull$spreadPred = predict(oppScoreModel, Xfull) - predict(scoreModel, Xfull)
+
+Yfull = as.factor(CenteredScaledDF$win)
+Yfull = relevel(Yfull, ref="1")
+
+#rm(CenteredScaledDF)
+
+Xtrain = Xfull[trainIndex,]
+Xvalid = Xfull[validIndex,]
+Xtest = Xfull[testIndex,]
+
+Ytrain = Yfull[trainIndex]
+Yvalid = Yfull[validIndex]
+Ytest = Yfull[testIndex]
+
+set.seed(42)
+
+K = 10
+trControl = trainControl(method = 'cv', number = K)
+tuneGrid = expand.grid('alpha'=c(0, 0.25, 0.5, 0.75, 1), 'lambda' = 10^seq(log10(0.001), log10(100), length.out=20))
+outLogistic = train(x = Xtrain %>% select(-c(wlProbs, spreadPred)), y = Ytrain, trControl = trControl, method = 'glmnet', tuneGrid=tuneGrid)
+glmOut = glmnet(x = Xtrain %>% select(-c(wlProbs, spreadPred)), y = Ytrain, alpha = outLogistic$bestTune$alpha,
+                family='binomial', standardize=FALSE)
+
+YhatValidLogistic_tourney = predict(glmOut, as.matrix(Xvalid %>% select(-c(wlProbs, spreadPred))), s=outLogistic$bestTune$lambda, type='response')
+
+#saveRDS(outLogistic, file='../models/RegularSeasonWL.rda')
+```
+
+```{r}
+calibProbs = calibration(Yvalid ~ YhatValidLogistic_tourney, cuts=8)
+xyplot(calibProbs)
+```
+
+```{r}
+rocOutLogistic = roc(response = Yfull, predict(outLogistic, Xfull, type='prob')$"1")
+plot(rocOutLogistic)
+```
+
+```{r}
+CenteredScaledDF = CenteredScaledDF %>%
+                    filter(Season != 2022)
+
+partitionVars = CenteredScaledDF %>%
+                  select(Season, win) %>%
+                  mutate_all(as.factor)
+
+Xfull = CenteredScaledDF %>%
+          select(-c(Season, gameid, TeamID, OppID, Loc, win, score, score_opp, totalScore))
+Xfull$spreadPred = predict(oppScoreModel, Xfull) - predict(scoreModel, Xfull)
+
+Yfull = CenteredScaledDF %>%
+          mutate(finalSpread = score_opp - score) %>%
+          pull(finalSpread)
+
+rm(CenteredScaledDF)
+```
+
+```{r}
+Xtrain = Xfull[trainIndex,]
+Xvalid = Xfull[validIndex,]
+Xtest = Xfull[testIndex,]
+
+Ytrain = Yfull[trainIndex]
+Yvalid = Yfull[validIndex]
+Ytest = Yfull[testIndex]
+```
+
+```{r}
+tibble('Preds' = predict(oppScoreModel, Xfull) - predict(scoreModel, Xfull),
+                   'Actual' = Yfull) %>%
+  mutate(Resid = Actual - Preds) %>%
+  ggplot(aes(x = Preds, y = Resid)) +
+  geom_point()
+
+```
+
+```{r}
+set.seed(42)
+
+K = 10
+trControl = trainControl(method = 'cv', number = K)
+outRegressScore = train(x = Xtrain %>% select(-spreadPred), y = Ytrain, trControl = trControl,
+                        method = 'lm', tuneGrid = expand.grid(intercept=FALSE))
+
+YhatValidRegressScore = predict(outRegressScore, Xvalid)
+
+lassoOut = train(x = Xtrain, y = Ytrain, trControl=trControl, method='lasso', tuneLength=100)
+
+# only feature is predicted spread (predict opp score - predict score based on regular season)
+#saveRDS(outRegressScore, file='../models/TourneySpreadModel.rda')
+```
+
+```{r}
+spreadModel = readRDS('../models/SpreadModel.rda')
+tibble('Preds' = predict(spreadModel, Xvalid),
+                   'Actual' = Yvalid) %>%
+  mutate(Resid = Actual - Preds) %>%
+  ggplot(aes(x = Preds, y = Resid)) +
+  geom_point()
+
+```
+
+```{r}
+CenteredScaledDF = CenteredScaledDF %>%
+                    filter(Season != 2022)
+
+partitionVars = CenteredScaledDF %>%
+                  select(Season, win) %>%
+                  mutate_all(as.factor)
+
+Xfull = CenteredScaledDF %>%
+          select(-c(Season, gameid, TeamID, OppID, Loc, win, score, score_opp, totalScore))
+Xfull$totalPred = predict(totalModel, Xfull)
+
+Yfull = CenteredScaledDF$totalScore
+
+rm(CenteredScaledDF)
+```
+
+```{r}
+Xtrain = Xfull[trainIndex,]
+Xvalid = Xfull[validIndex,]
+Xtest = Xfull[testIndex,]
+
+Ytrain = Yfull[trainIndex]
+Yvalid = Yfull[validIndex]
+Ytest = Yfull[testIndex]
+```
+
+```{r}
+tibble('Preds' = predict(totalModel, Xvalid),
+                   'Actual' = Yvalid) %>%
+  mutate(Resid = Actual - Preds) %>%
+  ggplot(aes(x = Preds, y = Resid)) +
+  geom_point()
+```
+
+```{r}
+set.seed(42)
+
+K = 10
+trControl = trainControl(method = 'cv', number = K)
+outRegressScore = train(x = Xtrain %>% select(totalPred), y = Ytrain, trControl = trControl,
+                        method = 'lm')
+
+YhatValidRegressScore = predict(outRegressScore, Xvalid)
+
+# only feature is predicted spread (predict opp score - predict score based on regular season)
+saveRDS(outRegressScore, file='../models/TourneyTotalPointsModel.rda')
+```
+
+```{r}
+tibble('Preds' = predict(outRegressScore, Xvalid %>% select(totalPred)),
+                   'Actual' = Yvalid) %>%
+  mutate(Resid = Actual - Preds) %>%
+  ggplot(aes(x = Preds, y = Resid)) +
+  geom_point()
+```
+

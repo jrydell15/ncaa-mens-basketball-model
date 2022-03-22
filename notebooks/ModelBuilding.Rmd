@@ -1,0 +1,369 @@
+---
+title: "Model Building"
+output: html_document
+---
+
+# Loading Libraries and Data Sets
+```{r setup, include=FALSE}
+library(tidyverse)
+library(caret)
+library(pROC)
+
+theme_set(theme_minimal())
+
+load('../data/input/CenteredScaledDF.Rdata')
+```
+
+```{r}
+CenteredScaledDF = CenteredScaledDF %>%
+                    filter(Season != 2022)
+
+partitionVars = CenteredScaledDF %>%
+                  select(Season, win) %>%
+                  mutate_all(as.factor)
+
+Xfull = CenteredScaledDF %>%
+          select(-c(Season, gameid, TeamID, OppID, Loc, win, score, score_opp, totalScore))
+Yfull = as.factor(CenteredScaledDF$win)
+Yfull = relevel(Yfull, ref="1")
+
+rm(CenteredScaledDF)
+```
+
+About the data: these are opponent and location adjusted numbers that have been centered and scaled on a season-by-season basis to put all seasons and teams on a level playing field. With a dataset of over 100k regular season games, the data will be partitioned on a 50%/25%/25% training/validation/test split. The partitions will be formed to keep the Season and wins approximately equivalent. The current season (2022) will not be used to build this model because the goal of the model is to be trained on full seasons to predict the NCAA tournament. Since the 2022 season does not currently have all of the data necessary, it will not be included in training.
+
+```{r}
+set.seed(42)
+n = nrow(partitionVars)
+groups = partitionVars %>%
+          group_by(Season, win) %>%
+          group_indices()
+trainIndex = createDataPartition(as.factor(groups), p=0.5, list=FALSE) %>% as.vector(.)
+
+validSplit = createDataPartition(as.factor(groups)[-trainIndex], p=0.5, list=FALSE) %>% as.vector(.)
+
+testIndex = (1:n)[-trainIndex][-validSplit]
+validIndex = (1:n)[-trainIndex][validSplit]
+```
+
+Check to make sure partitions are valid.
+
+```{r}
+partitionVars[trainIndex,] %>%
+  group_by(Season) %>%
+  summarize(SeasonPct = n() / length(trainIndex),
+            WinPct = sum(as.numeric(win) - 1) / n())
+
+partitionVars[validIndex,] %>%
+  group_by(Season) %>%
+  summarize(SeasonPct = n() / length(trainIndex),
+            WinPct = sum(as.numeric(win) - 1) / n())
+
+partitionVars[testIndex,] %>%
+  group_by(Season) %>%
+  summarize(SeasonPct = n() / length(trainIndex),
+            WinPct = sum(as.numeric(win) - 1) / n())
+```
+
+Looks good, let's move on.
+
+```{r}
+Xtrain = Xfull[trainIndex,]
+Xvalid = Xfull[validIndex,]
+Xtest = Xfull[testIndex,]
+
+Ytrain = Yfull[trainIndex]
+Yvalid = Yfull[validIndex]
+Ytest = Yfull[testIndex]
+```
+
+
+The models that will be trained are:
+* Simple Logistic Regression
+* Penalized Logistic Regression
+* Random Forest
+
+The first model will be a simple Logistic Regression.
+
+```{r}
+set.seed(42)
+
+K = 10
+trControl = trainControl(method = 'cv', number = K)
+outLogistic = train(x = Xtrain, y = Ytrain, trControl = trControl, method = 'glm')
+
+YhatValidLogistic = predict(outLogistic, Xvalid, type='prob')
+
+saveRDS(outLogistic, file='../models/RegularSeasonWL.rda')
+```
+
+```{r}
+calibProbs = calibration(Yvalid ~ YhatValidLogistic$"1", cuts=8)
+xyplot(calibProbs)
+```
+
+This is really promising! Let's check the ROC Curve too:
+
+```{r}
+rocOutLogistic = roc(response = Yvalid, YhatValidLogistic$"1")
+plot(rocOutLogistic)
+```
+
+That seems pretty good versus the choose at random case. The problem is pretty difficult, so this is good. Let's pull a threshold required a sensitivity of 80%.
+
+```{r}
+pt8_Logistic = which.min(rocOutLogistic$sensitivities >= 0.8)
+threshold_Logistic = rocOutLogistic$thresholds[pt8_Logistic]
+specificity_Logistic = rocOutLogistic$specificities[pt8_Logistic]
+```
+
+A threshold of `r round(threshold_Logistic, 3)` results in a sensitivity of `r round(rocOutLogistic$sensitivities[pt8_Logistic], 3)` and a specificity of `r round(specificity_Logistic, 3)`. Pretty decent numbers. We will compare Cross Entropy later, but that will be once we have all of the models built.
+
+```{r}
+CenteredScaledDF = CenteredScaledDF %>%
+                    filter(Season != 2022)
+
+partitionVars = CenteredScaledDF %>%
+                  select(Season, win) %>%
+                  mutate_all(as.factor)
+
+Xfull = CenteredScaledDF %>%
+          select(-c(Season, gameid, TeamID, OppID, Loc, win, score, score_opp, totalScore))
+Yfull = CenteredScaledDF$score
+
+rm(CenteredScaledDF)
+```
+
+```{r}
+set.seed(42)
+n = nrow(partitionVars)
+groups = partitionVars %>%
+          group_by(Season, win) %>%
+          group_indices()
+trainIndex = createDataPartition(as.factor(groups), p=0.5, list=FALSE) %>% as.vector(.)
+
+validSplit = createDataPartition(as.factor(groups)[-trainIndex], p=0.5, list=FALSE) %>% as.vector(.)
+
+testIndex = (1:n)[-trainIndex][-validSplit]
+validIndex = (1:n)[-trainIndex][validSplit]
+```
+
+```{r}
+Xtrain = Xfull[trainIndex,]
+Xvalid = Xfull[validIndex,]
+Xtest = Xfull[testIndex,]
+
+Ytrain = Yfull[trainIndex]
+Yvalid = Yfull[validIndex]
+Ytest = Yfull[testIndex]
+```
+
+```{r}
+set.seed(42)
+
+K = 10
+trControl = trainControl(method = 'cv', number = K)
+outRegressScore = train(x = Xtrain, y = Ytrain, trControl = trControl, method = 'lm')
+
+YhatValidRegressScore = predict(outRegressScore, Xvalid)
+
+saveRDS(outRegressScore, file='../models/RegularSeasonScoreRegression.rda')
+```
+```{r}
+compareDF = tibble('Preds' = YhatValidRegressScore,
+                   'Actual' = Yvalid)
+
+compareDF %>% mutate(Resid = Actual - Preds) %>%
+  ggplot(aes(x = Preds, y = Resid)) +
+  geom_point()
+```
+
+## Opponent Score
+```{r}
+CenteredScaledDF = CenteredScaledDF %>%
+                    filter(Season != 2022)
+
+partitionVars = CenteredScaledDF %>%
+                  select(Season, win) %>%
+                  mutate_all(as.factor)
+
+Xfull = CenteredScaledDF %>%
+          select(-c(Season, gameid, TeamID, OppID, Loc, win, score, score_opp, totalScore))
+Yfull = CenteredScaledDF$score_opp
+
+rm(CenteredScaledDF)
+```
+
+```{r}
+set.seed(42)
+n = nrow(partitionVars)
+groups = partitionVars %>%
+          group_by(Season, win) %>%
+          group_indices()
+trainIndex = createDataPartition(as.factor(groups), p=0.5, list=FALSE) %>% as.vector(.)
+
+validSplit = createDataPartition(as.factor(groups)[-trainIndex], p=0.5, list=FALSE) %>% as.vector(.)
+
+testIndex = (1:n)[-trainIndex][-validSplit]
+validIndex = (1:n)[-trainIndex][validSplit]
+```
+
+```{r}
+Xtrain = Xfull[trainIndex,]
+Xvalid = Xfull[validIndex,]
+Xtest = Xfull[testIndex,]
+
+Ytrain = Yfull[trainIndex]
+Yvalid = Yfull[validIndex]
+Ytest = Yfull[testIndex]
+```
+
+```{r}
+set.seed(42)
+
+K = 10
+trControl = trainControl(method = 'cv', number = K)
+outRegressScore_opp = train(x = Xtrain, y = Ytrain, trControl = trControl, method = 'lm')
+
+YhatValidRegressScore_opp = predict(outRegressScore_opp, Xvalid)
+
+saveRDS(outRegressScore_opp, file='../models/RegularSeasonScoreRegressionOpponent.rda')
+```
+
+```{r}
+compareDF = tibble('Preds' = YhatValidRegressScore_opp,
+                   'Actual' = Yvalid)
+
+compareDF %>% mutate(Resid = Actual - Preds) %>%
+  ggplot(aes(x = Preds, y = Resid)) +
+  geom_point()
+```
+
+```{r}
+CenteredScaledDF = CenteredScaledDF %>%
+                    filter(Season != 2022)
+
+partitionVars = CenteredScaledDF %>%
+                  select(Season, win) %>%
+                  mutate_all(as.factor)
+
+Xfull = CenteredScaledDF %>%
+          select(-c(Season, gameid, TeamID, OppID, Loc, win, score, score_opp, totalScore))
+Yfull = CenteredScaledDF$totalScore
+
+rm(CenteredScaledDF)
+```
+
+```{r}
+set.seed(42)
+n = nrow(partitionVars)
+groups = partitionVars %>%
+          group_by(Season, win) %>%
+          group_indices()
+trainIndex = createDataPartition(as.factor(groups), p=0.5, list=FALSE) %>% as.vector(.)
+
+validSplit = createDataPartition(as.factor(groups)[-trainIndex], p=0.5, list=FALSE) %>% as.vector(.)
+
+testIndex = (1:n)[-trainIndex][-validSplit]
+validIndex = (1:n)[-trainIndex][validSplit]
+```
+
+```{r}
+Xtrain = Xfull[trainIndex,]
+Xvalid = Xfull[validIndex,]
+Xtest = Xfull[testIndex,]
+
+Ytrain = Yfull[trainIndex]
+Yvalid = Yfull[validIndex]
+Ytest = Yfull[testIndex]
+```
+
+```{r}
+set.seed(42)
+
+K = 10
+trControl = trainControl(method = 'cv', number = K)
+outRegressTotalScore = train(x = Xtrain, y = Ytrain, trControl = trControl, method = 'lm')
+
+YhatValidRegressTotalScore = predict(outRegressTotalScore, Xvalid)
+
+saveRDS(outRegressTotalScore, file='../models/RegularSeasonScoreRegressionTotalScore.rda')
+```
+
+```{r}
+compareDF = tibble('Preds' = YhatValidRegressTotalScore,
+                   'Actual' = Yvalid)
+
+compareDF %>% mutate(Resid = Actual - Preds) %>%
+  ggplot(aes(x = Preds, y = Resid)) +
+  geom_point()
+```
+
+```{r}
+load('../data/input/CenteredScaledDF.Rdata')
+scoreModel = readRDS('../models/RegularSeasonScoreRegression.rda')
+oppScoreModel = readRDS('../models/RegularSeasonScoreRegressionOpponent.rda')
+
+CenteredScaledDF = CenteredScaledDF %>%
+                    filter(Season != 2022)
+
+partitionVars = CenteredScaledDF %>%
+                  select(Season, win) %>%
+                  mutate_all(as.factor)
+
+Xfull = CenteredScaledDF %>%
+          select(-c(Season, gameid, TeamID, OppID, Loc, win, score, score_opp, totalScore))
+Xfull$spreadPred = predict(oppScoreModel, Xfull) - predict(scoreModel, Xfull)
+
+Yfull = CenteredScaledDF %>%
+          mutate(finalSpread = score_opp - score) %>%
+          pull(finalSpread)
+
+rm(CenteredScaledDF)
+```
+
+```{r}
+Xtrain = Xfull[trainIndex,]
+Xvalid = Xfull[validIndex,]
+Xtest = Xfull[testIndex,]
+
+Ytrain = Yfull[trainIndex]
+Yvalid = Yfull[validIndex]
+Ytest = Yfull[testIndex]
+```
+
+```{r}
+tibble('Season' = CenteredScaledDF$Season,
+       'Preds' = predict(oppScoreModel, CenteredScaledDF) - predict(scoreModel, CenteredScaledDF),
+       'Actual' = Yfull) %>%
+  mutate(Resid = Actual - Preds) %>%
+  ggplot(aes(x = Preds, y = Resid, color=as.factor(Season))) +
+  geom_point()
+
+```
+
+
+```{r}
+set.seed(42)
+
+K = 10
+trControl = trainControl(method = 'cv', number = K)
+outRegressScore = train(x = Xtrain %>% select(-spreadPred), y = Ytrain, trControl = trControl,
+                        method = 'lm')
+
+YhatValidRegressScore = predict(outRegressScore, Xvalid)
+
+#lassoOut = train(x = Xtrain, y = Ytrain, trControl=trControl, method='lasso', tuneLength=100)
+
+# normal features
+saveRDS(outRegressScore, file='../models/SpreadModel.rda')
+```
+
+```{r}
+tibble('Preds' = YhatValidRegressScore,
+                   'Actual' = Yvalid) %>%
+  mutate(Resid = Actual - Preds) %>%
+  ggplot(aes(x = Preds, y = Resid)) +
+  geom_point()
+
+```

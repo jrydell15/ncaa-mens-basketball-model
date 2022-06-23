@@ -1,4 +1,4 @@
-# NBA Win-Loss Model
+# NCAA Win-Loss Model
 
 ## Project Intro
 
